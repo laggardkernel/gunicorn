@@ -43,6 +43,7 @@ class Worker(object):
         self.age = age
         self.pid = "[booting]"
         self.ppid = ppid
+        # NOTE(lk): workers share the same socket pool
         self.sockets = sockets
         self.app = app
         self.timeout = timeout
@@ -52,13 +53,14 @@ class Worker(object):
         self.reloader = None
 
         self.nr = 0
-
+        # CO(lk): worker stops after handling too many requests. `Worker.alive`
+        #  is changed to False, and killed in `Arbiter.murder_workers()`
         if cfg.max_requests > 0:
             jitter = randint(0, cfg.max_requests_jitter)
             self.max_requests = cfg.max_requests + jitter
         else:
             self.max_requests = sys.maxsize
-
+        # NOTE(lk): .alive controls whether to handle req from sockets
         self.alive = True
         self.log = log
         self.tmp = WorkerTmp(cfg)
@@ -88,12 +90,13 @@ class Worker(object):
         in the function should be to call this method with
         super().init_process() so that the ``run()`` loop is initiated.
         """
-
         # set environment' variables
         if self.cfg.env:
             for k, v in self.cfg.env.items():
                 os.environ[k] = v
+        # CO(lk): since the worker process is forked, copy and set env from parent
 
+        # CO(lk): set user, group, main group for current process
         util.set_owner_process(self.cfg.uid, self.cfg.gid,
                                initgroups=self.cfg.initgroups)
 
@@ -105,12 +108,17 @@ class Worker(object):
         for p in self.PIPE:
             util.set_non_blocking(p)
             util.close_on_exec(p)
+        # CO(lk): all workers share socket pool from master/arbiter
+        #  workers != LISTENERS. when a listener is ready, one worker tried to
+        #  process it.
 
         # Prevent fd inheritance
         for s in self.sockets:
             util.close_on_exec(s)
         util.close_on_exec(self.tmp.fileno())
-
+        # NOTE(lk): write side is used to be written when a sig comes in
+        #  `Worker.init_signals()`. The read side is added into `Worker.wait_fds`
+        #  which is used in `select.select()`.
         self.wait_fds = self.sockets + [self.PIPE[0]]
 
         self.log.close_on_exec()
@@ -121,9 +129,13 @@ class Worker(object):
         if self.cfg.reload:
             def changed(fname):
                 self.log.info("Worker reloading: %s modified", fname)
+                # CO(lk): when reloaded, stop processing req, tmp file not updated.
+                #  `Arbiter.murder_workers()` kill workers timed out.
                 self.alive = False
                 os.write(self.PIPE[1], b"1")
                 self.cfg.worker_int(self)
+                # CO(lk): reloader is for testing. For upgrading on the fly,
+                #  use USR2.
                 time.sleep(0.1)
                 sys.exit(0)
 
@@ -131,10 +143,14 @@ class Worker(object):
             self.reloader = reloader_cls(extra_files=self.cfg.reload_extra_files,
                                          callback=changed)
 
+        # CO(lk): Application.wsgi(), or Application.callable may already be
+        #  pre loaded in Arbiter.setup() -> Config.preload_app
         self.load_wsgi()
+        # NOTE(lk): very import. Start reloader after all modules imported.
         if self.reloader:
+            # CO(lk): start reloader thread, which calls .run()
             self.reloader.start()
-
+        # CO(lk): hook func "post_worker_init"
         self.cfg.post_worker_init(self)
 
         # Enter main run loop
@@ -165,6 +181,9 @@ class Worker(object):
                 del exc_tb
 
     def init_signals(self):
+        # CO(lk): reset signal is important. The worker is forked from Arbiter,
+        #  the signal by default handled by Arbiter.
+        #  https://github.com/encode/uvicorn/issues/894
         # reset signaling
         for s in self.SIGNALS:
             signal.signal(s, signal.SIG_DFL)
@@ -176,13 +195,23 @@ class Worker(object):
         signal.signal(signal.SIGUSR1, self.handle_usr1)
         signal.signal(signal.SIGABRT, self.handle_abort)
 
+        # TODO(lk): comment from git blame: keep graceful shutdown from
+        #  interrupting workers
         # Don't let SIGTERM and SIGUSR1 disturb active requests
         # by interrupting system calls
         signal.siginterrupt(signal.SIGTERM, False)
         signal.siginterrupt(signal.SIGUSR1, False)
 
         if hasattr(signal, 'set_wakeup_fd'):
+            # NOTE(lk): difference with PIPE in Arbiter.
+            #  PIPE in Arbiter is used to call manage_workers(), while PIPE in
+            #  worker is used to wakeup select waiting.
+            #  > Set the wakeup file descriptor to fd. When a signal is received,
+            #  the signal number is written as a single byte into the fd.
+            #  This can be used by a library to wakeup a poll or select call,
+            #  allowing the signal to be fully processed.
             signal.set_wakeup_fd(self.PIPE[1])
+            # CO(lk): need to wake up to respond to the signal
 
     def handle_usr1(self, sig, frame):
         self.log.reopen_files()
@@ -194,6 +223,7 @@ class Worker(object):
         self.alive = False
         # worker_int callback
         self.cfg.worker_int(self)
+        # CO(lk): hook func "worker_int", not init
         time.sleep(0.1)
         sys.exit(0)
 
@@ -202,6 +232,7 @@ class Worker(object):
         self.cfg.worker_abort(self)
         sys.exit(1)
 
+    # CO(lk): Called in request handling in subclass, e.g. SyncWorker
     def handle_error(self, req, client, addr, exc):
         request_start = datetime.now()
         addr = addr or ('', -1)  # unix socket case
@@ -261,6 +292,7 @@ class Worker(object):
             resp = Response(req, client, self.cfg)
             resp.status = "%s %s" % (status_int, reason)
             resp.response_length = len(mesg)
+            # CO(lk): err resp is logged but not sent?
             self.log.access(resp, req, environ, request_time)
 
         try:

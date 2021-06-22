@@ -33,6 +33,8 @@ def listen_fds(unset_environment=True):
         `<https://www.freedesktop.org/software/systemd/man/sd_listen_fds.html>`_
 
     """
+    # NOTE(lk): LISTEN_FDS, LISTEN_PID used internally, passed from parent process
+    #  by Arbiter.reexec()? Nope, these 2 is set by systemd.
     fds = int(os.environ.get('LISTEN_FDS', 0))
     listen_pid = int(os.environ.get('LISTEN_PID', 0))
 

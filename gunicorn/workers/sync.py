@@ -26,14 +26,19 @@ class SyncWorker(base.Worker):
 
     def accept(self, listener):
         client, addr = listener.accept()
+        # CO(lk): this is a SyncWorker
         client.setblocking(1)
         util.close_on_exec(client)
         self.handle(listener, client, addr)
 
     def wait(self, timeout):
         try:
+            # NOTE(lk): notify(), update ctime of Worker.tmp.
+            #  Arbiter.murder_workers() will clean up timeout workers
             self.notify()
+            # CO(lk): Worker.PIPE is written when a signal comes
             ret = select.select(self.wait_fds, [], [], timeout)
+            # CO(lk): we only select on read fds
             if ret[0]:
                 if self.PIPE[0] in ret[0]:
                     os.read(self.PIPE[0], 1)
@@ -50,6 +55,7 @@ class SyncWorker(base.Worker):
             raise
 
     def is_parent_alive(self):
+        # CO(lk): once the master/arbiter died, workers are handled by init or systemd
         # If our parent changed then we shut down.
         if self.ppid != os.getppid():
             self.log.info("Parent changed, shutting down: %s", self)
@@ -58,6 +64,8 @@ class SyncWorker(base.Worker):
 
     def run_for_one(self, timeout):
         listener = self.sockets[0]
+        # CO(lk): worker handles signal by changing `Worker.alive`. If not alive,
+        #  stop processing request.
         while self.alive:
             self.notify()
 
@@ -72,6 +80,9 @@ class SyncWorker(base.Worker):
                 # process.
                 continue
 
+            # CO(lk): `EnvironmentError` is used for backward compatibility.
+            #  After Python 3.3, EnvironmentError, IOError are aliases to OSError.
+            #  https://blog.dreamfever.me/2018/02/28/gunicorn-yuan-ma-fen-xi-ii-worker/
             except EnvironmentError as e:
                 if e.errno not in (errno.EAGAIN, errno.ECONNABORTED,
                                    errno.EWOULDBLOCK):
@@ -79,7 +90,8 @@ class SyncWorker(base.Worker):
 
             if not self.is_parent_alive():
                 return
-
+            # CO(lk): when only 1 socket, normally processed above.
+            #  This branch serves as a fallback when no new client is coming.
             try:
                 self.wait(timeout)
             except StopWaiting:

@@ -42,6 +42,7 @@ class WorkerTmp(object):
         self.spinner = 0
 
     def notify(self):
+        # CO(lk): update ctime by change file perm
         self.spinner = (self.spinner + 1) % 2
         os.fchmod(self._tmp.fileno(), self.spinner)
 

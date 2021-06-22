@@ -32,6 +32,7 @@ class Arbiter(object):
 
     # A flag indicating if an application failed to be loaded
     APP_LOAD_ERROR = 4
+    # CO(lk): custom exit code, raised in .spawn_worker(), detected in .reap_workers()
 
     START_CTX = {}
 
@@ -60,7 +61,9 @@ class Arbiter(object):
         self.pidfile = None
         self.systemd = False
         self.worker_age = 0
+        # CO(lk): when create `reexec` child, save child pid in `.reexec_pid` for the parent
         self.reexec_pid = 0
+        # CO(lk): normally 0. only set non-0 as parent pid for the arbiter child
         self.master_pid = 0
         self.master_name = "Master"
 
@@ -93,6 +96,8 @@ class Arbiter(object):
             self.log = self.cfg.logger_class(app.cfg)
 
         # reopen files
+        # TODO(lk): GUNICORN_FD means the current process is `exec`ed from an old
+        #  process. `Arbiter.log` is set to close on exec. Is this necessary?
         if 'GUNICORN_FD' in os.environ:
             self.log.reopen_files()
 
@@ -113,7 +118,8 @@ class Arbiter(object):
         if self.cfg.env:
             for k, v in self.cfg.env.items():
                 os.environ[k] = v
-
+        # NOTE(lk): copy-on-write (COW), save ram, speed fork.
+        #  Drawback: can't reload app but only config file
         if self.cfg.preload_app:
             self.app.wsgi()
 
@@ -123,6 +129,10 @@ class Arbiter(object):
         """
         self.log.info("Starting gunicorn %s", __version__)
 
+        # NOTE(lk): GUNICORN_PID, GUNICORN_FD used internally,
+        #  passed from parent process by Arbiter.reexec()
+        # CO(lk): current process is `reexec`ed, share same "master_id" with parent
+        #  use `.2` suffix to differentiate them
         if 'GUNICORN_PID' in os.environ:
             self.master_pid = int(os.environ.get('GUNICORN_PID'))
             self.proc_name = self.proc_name + ".2"
@@ -139,8 +149,13 @@ class Arbiter(object):
 
         self.init_signals()
 
+        # NOTE(lk): Use file descriptors, or host:port
+        #  fd from systemd, fd from GUNICORN_FD
+        #  (host, port) from Config.
+        #  which could be confirmed in sock.create_sockets()
         if not self.LISTENERS:
             fds = None
+            # CO(lk): fds sequences (start from 3) inherited from systemd socket activation
             listen_fds = systemd.listen_fds()
             if listen_fds:
                 self.systemd = True
@@ -148,22 +163,25 @@ class Arbiter(object):
                             systemd.SD_LISTEN_FDS_START + listen_fds)
 
             elif self.master_pid:
+                # CO(lk): if master_pid is not 0, the master is child `reexec`ed.
                 fds = []
+                # CO(lk): as a `reexec`ed child, used the same fd from parent
                 for fd in os.environ.pop('GUNICORN_FD').split(','):
                     fds.append(int(fd))
-
+            # NOTE(lk): only one of the type unix socket(fd), tcp socket(bind) is used
             self.LISTENERS = sock.create_sockets(self.cfg, self.log, fds)
 
         listeners_str = ",".join([str(l) for l in self.LISTENERS])
         self.log.debug("Arbiter booted")
         self.log.info("Listening at: %s (%s)", listeners_str, self.pid)
         self.log.info("Using worker: %s", self.cfg.worker_class_str)
+        # CO(lk): notify systemd with socket conn. If run within systemd is detected
         systemd.sd_notify("READY=1\nSTATUS=Gunicorn arbiter booted", self.log)
 
         # check worker class requirements
         if hasattr(self.worker_class, "check_config"):
             self.worker_class.check_config(self.cfg, self.log)
-
+        # CO(lk): call hook func "when_ready"
         self.cfg.when_ready(self)
 
     def init_signals(self):
@@ -179,35 +197,50 @@ class Arbiter(object):
         self.PIPE = pair = os.pipe()
         for p in pair:
             util.set_non_blocking(p)
+            # CO(lk): avoid fd leaking to forked processes
             util.close_on_exec(p)
-
+        # CO(lk): close `FileHandler` on `exec`, avoid inherited by `exec`ed process
         self.log.close_on_exec()
 
         # initialize all signals
         for s in self.SIGNALS:
             signal.signal(s, self.signal)
+        # CO(lk): SIGCHLD, notify parent one of its child process ended.
+        #  processed directly without putting sig into queue
         signal.signal(signal.SIGCHLD, self.handle_chld)
+        # TODO(lk):
+        #  - `handle_chld()` separated without any explanation. 1/16/10 by Chesneau
+        #  - why don't set `signal.set_wakeup_fd()` on Arbiter. Because of SIG_QUEUE?
 
     def signal(self, sig, frame):
+        # CO(lk): don't handle the sig directly but save it to a queue
+        #  wakeup child processes to handle it in main loop under Arbiter.run()
         if len(self.SIG_QUEUE) < 5:
             self.SIG_QUEUE.append(sig)
+            # CO(lk): put sth into PIPE to avoid wait 1s to get obj from queue
             self.wakeup()
 
     def run(self):
         "Main master loop."
+        # CO(lk): start(), init siginals, create LISTENERS
         self.start()
         util._setproctitle("master [%s]" % self.proc_name)
 
         try:
+            # CO(lk): create or delete workers to meet worker number
             self.manage_workers()
 
             while True:
+                # NOTE(lk): upgrade on the fly. kill the old arbiter and
+                #  promote the new one.
                 self.maybe_promote_master()
-
+                # CO(lk): signal is not processed directly, but collected in queue
                 sig = self.SIG_QUEUE.pop(0) if self.SIG_QUEUE else None
                 if sig is None:
                     self.sleep()
+                    # CO(lk): close workers timed out
                     self.murder_workers()
+                    # CO(lk): create or delete workers to meet worker number
                     self.manage_workers()
                     continue
 
@@ -222,10 +255,19 @@ class Arbiter(object):
                     continue
                 self.log.info("Handling signal: %s", signame)
                 handler()
+                # NOTE(lk): wakeup() let us skip sleep() timeout in next loop.
+                #  Cause after handling current signal, worker status may be
+                #  changed, need to manage_workers() as soon as possible.
+                #  commit made by Chesneau in 2010-01-21 db01c21
                 self.wakeup()
         except (StopIteration, KeyboardInterrupt):
+            # NOTE(lk): handle_term, int, quit
+            #  int, quit call Arbiter.stop(False) themselves. while term doesn't
+            #  Defensive, in case stop(False) failed? Nope. Force quit workers.
+            #  No way to differentiate them with only `StopIteration`.
             self.halt()
         except HaltServer as inst:
+            # CO(lk): handle_chld() -> reap_workers()
             self.halt(reason=inst.reason, exit_status=inst.exit_status)
         except SystemExit:
             raise
@@ -239,6 +281,8 @@ class Arbiter(object):
 
     def handle_chld(self, sig, frame):
         "SIGCHLD handling"
+        # CO(lk): kill hanging workers. Since worker number may be changed,
+        #  wakeup() to skip wait in sleep()
         self.reap_workers()
         self.wakeup()
 
@@ -304,6 +348,17 @@ class Arbiter(object):
     def handle_winch(self):
         """SIGWINCH handling"""
         if self.cfg.daemon:
+            # CO(lk): equivalent to
+            #  if os.getppid() == 1 or os.getpgrp() != os.getpid():
+            #  The expected way to hot upgrade
+            #  1. USR2, reexec a new arbiter
+            #  2. WINCH, stop workers in the old arbiter
+            #  3. TERM, kill and exit the old arbiter
+            #  The new arbiter will promote itself automatically
+            #  The problem is non-daemon arbiter can't handle WINCH. There's no
+            #  way WINCH is sent by user, or emited by terminal after resizing.
+            #  For non-daemon arbiter, stopping workers is delayed at TERM.
+            #  So the question why WINCH is chosen to stop workers processing req?
             self.log.info("graceful stop of workers")
             self.num_workers = 0
             self.kill_workers(signal.SIGTERM)
@@ -311,15 +366,18 @@ class Arbiter(object):
             self.log.debug("SIGWINCH ignored. Not daemonized")
 
     def maybe_promote_master(self):
+        # CO(lk): master_pid, if non 0, it's `reexec`ed child
         if self.master_pid == 0:
             return
-
+        # NOTE(lk): once parent is killed, the child arbiter is managed
+        #  by parent of parent arbiter. Promote the `reexec`ed child.
         if self.master_pid != os.getppid():
             self.log.info("Master has been promoted.")
             # reset master infos
             self.master_name = "Master"
             self.master_pid = 0
             self.proc_name = self.cfg.proc_name
+            # CO(lk): GUNICORN_FD is cleaned in Arbiter.start()
             del os.environ['GUNICORN_PID']
             # rename the pidfile
             if self.pidfile is not None:
@@ -354,6 +412,7 @@ class Arbiter(object):
         A readable PIPE means a signal occurred.
         """
         try:
+            # CO(lk): wait read file descriptor ready with timeout 1s if no content
             ready = select.select([self.PIPE[0]], [], [], 1.0)
             if not ready[0]:
                 return
@@ -375,12 +434,19 @@ class Arbiter(object):
         killed gracefully  (ie. trying to wait for the current connection)
         """
         unlink = (
+            # CO(lk): master_pid should be 0, unless it's `reexec`ed child
+            #  haven't been promoted.
+            #  reexec_pid is non 0 in the old arbiter/master has not been killed
+            #  after calling reexec.
             self.reexec_pid == self.master_pid == 0
             and not self.systemd
             and not self.cfg.reuse_port
         )
         sock.close_sockets(self.LISTENERS, unlink)
 
+        # NOTE(lk):
+        #  TERM, set Worker.alive = False, stop handling req
+        #  QUIT, kill worker directly
         self.LISTENERS = []
         sig = signal.SIGTERM
         if not graceful:
@@ -391,7 +457,9 @@ class Arbiter(object):
         # wait until the graceful timeout
         while self.WORKERS and time.time() < limit:
             time.sleep(0.1)
-
+        # NOTE(lk): called kill_worker() twice to found out died worker,
+        #  and pop them out of .WORKERS. Since the 1st sig to worker may be TERM,
+        #  which don't kill worker, but just stop it handling new requests
         self.kill_workers(signal.SIGKILL)
 
     def reexec(self):
@@ -412,7 +480,7 @@ class Arbiter(object):
             return
 
         self.cfg.pre_exec(self)
-
+        # CO(lk): use env vars to pass pid, fds to the new `reexec`ed child process
         environ = self.cfg.env_orig.copy()
         environ['GUNICORN_PID'] = str(master_pid)
 
@@ -427,6 +495,8 @@ class Arbiter(object):
 
         # exec the process using the original environment
         os.execvpe(self.START_CTX[0], self.START_CTX['args'], environ)
+        # CO(lk): new process is not Worker, not added into `Arbiter.WORKERS`
+        #  So killing the old master by TERM do nothing with the new arbiter
 
     def reload(self):
         old_address = self.cfg.address
@@ -447,6 +517,9 @@ class Arbiter(object):
         # reload conf
         self.app.reload()
         self.setup(self.app)
+        # CO(lk): reload config(important if using conf file),
+        #  reset some attrs on Arbiter like app, cfg
+        # TODO(lk): reload doesn't expect log obj changed
 
         # reopen log files
         self.log.reopen_files()
@@ -479,24 +552,28 @@ class Arbiter(object):
         # spawn new workers
         for _ in range(self.cfg.workers):
             self.spawn_worker()
-
         # manage workers
         self.manage_workers()
+        # CO(lk): create new workers no matter what, and close those old workers
 
     def murder_workers(self):
         """\
         Kill unused/idle workers
         """
+        # TODO(lk): fix doc, kill workers timed out
         if not self.timeout:
             return
         workers = list(self.WORKERS.items())
         for (pid, worker) in workers:
             try:
+                # CO(lk): ctime of Worker.tmp is updated by Worker.notify()
+                #  before a req handling
                 if time.time() - worker.tmp.last_update() <= self.timeout:
                     continue
             except (OSError, ValueError):
                 continue
-
+            # CO(lk): close workers timed out
+            # TODO(lk): Worker.aborted, who set it
             if not worker.aborted:
                 self.log.critical("WORKER TIMEOUT (pid:%s)", pid)
                 worker.aborted = True
@@ -508,11 +585,18 @@ class Arbiter(object):
         """\
         Reap workers to avoid zombie processes
         """
+        # CO(lk): when SIGCHLD received, end hanging worker process.
+        #  os.waitpid(-1), Finding out hanging children of current Arbiter
+        #  > if pid is -1, the request pertains to any child of the cur process
+        #  os.wait() returns a 16-bit number, whose low byte is the signal number
+        #  that killed the process, and whose high byte is the exit status
+        #  (if the signal number is zero);
         try:
             while True:
                 wpid, status = os.waitpid(-1, os.WNOHANG)
                 if not wpid:
                     break
+                # CO(lk): if rexeced arbiter child is hanging
                 if self.reexec_pid == wpid:
                     self.reexec_pid = 0
                 else:
@@ -537,6 +621,7 @@ class Arbiter(object):
                     if not worker:
                         continue
                     worker.tmp.close()
+                    # CO(lk): call hook func on child exit
                     self.cfg.child_exit(self, worker)
         except OSError as e:
             if e.errno != errno.ECHILD:
@@ -551,10 +636,13 @@ class Arbiter(object):
             self.spawn_workers()
 
         workers = self.WORKERS.items()
+        # CO(lk): sort worker from older to newer for later kill_worker()
         workers = sorted(workers, key=lambda w: w[1].age)
         while len(workers) > self.num_workers:
             (pid, _) = workers.pop(0)
             self.kill_worker(pid, signal.SIGTERM)
+            # CO(lk): TERM to do a graceful shutdown.
+            #  pop worker out of list, without waiting it.
 
         active_worker_count = len(workers)
         if self._last_logged_active_worker_count != active_worker_count:
@@ -565,13 +653,22 @@ class Arbiter(object):
                                   "mtype": "gauge"})
 
     def spawn_worker(self):
+        # CO(lk): worker age, or worker sequence passed to Worker init
         self.worker_age += 1
+        # NOTE(lk): req handling timeout is half of the configured value
+        #  https://github.com/benoitc/gunicorn/issues/1886
+        #  Use half value to avoid race condition between
+        #  Worker.notify() and Arbiter.murder_workers(), or say it in another way,
+        #  between detecting ctime of Worker.tmp in Arbiter and
+        #  updating ctime of Worker.tmp in Worker
         worker = self.worker_class(self.worker_age, self.pid, self.LISTENERS,
                                    self.app, self.timeout / 2.0,
                                    self.cfg, self.log)
+        # CO(lk): call hook func "pre_fork"
         self.cfg.pre_fork(self, worker)
         pid = os.fork()
         if pid != 0:
+            # CO(lk): master process, return
             worker.pid = pid
             self.WORKERS[pid] = worker
             return pid
@@ -585,7 +682,9 @@ class Arbiter(object):
         try:
             util._setproctitle("worker [%s]" % self.proc_name)
             self.log.info("Booting worker with pid: %s", worker.pid)
+            # CO(lk): hook func "post_fork"
             self.cfg.post_fork(self, worker)
+            # NOTE(lk): Worker.init_process(). Block here for handling requests
             worker.init_process()
             sys.exit(0)
         except SystemExit:
@@ -638,9 +737,17 @@ class Arbiter(object):
         :attr pid: int, worker pid
         :attr sig: `signal.SIG*` value
          """
+        # TODO(lk): typo
+        # NOTE(lk): Sending signal to Worker by os.kill()
+        #  `kill_worker()` called twice by `.stop()` to pop out died worker from
+        #  `.WORKERS`, and close `WorkerTmp`
         try:
             os.kill(pid, sig)
         except OSError as e:
+            # NOTE(lk): Arbiter.stop() pass sig twice to workers. The 2nd time
+            #  pops out the worker from list.
+            #  man kill [ESRCH]
+            #  No process or process group can be found corresponding to that pid
             if e.errno == errno.ESRCH:
                 try:
                     worker = self.WORKERS.pop(pid)

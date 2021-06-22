@@ -244,6 +244,9 @@ def parse_address(netloc, default_port='8000'):
 
 
 def close_on_exec(fd):
+    # CO(lk):
+    #  > Linux 子进程是通过 fork-exec 来完成的，通过设置 FD_CLOEXEC 标志位
+    #  可以自动在 exec 时关闭无用的文件描述符。
     flags = fcntl.fcntl(fd, fcntl.F_GETFD)
     flags |= fcntl.FD_CLOEXEC
     fcntl.fcntl(fd, fcntl.F_SETFD, flags)
@@ -462,6 +465,8 @@ def daemonize(enable_stdio_inheritance=False):
     Standard daemonization of a process.
     http://www.svbug.com/documentation/comp.unix.programmer-FAQ/faq_2.html#SEC16
     """
+    # TODO(lk): avoid re-daemonize in `rexec`ed new process
+    #  should we ignore daemonize when managed by systemd
     if 'GUNICORN_FD' not in os.environ:
         if os.fork():
             os._exit(0)

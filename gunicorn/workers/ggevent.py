@@ -83,6 +83,7 @@ class GeventWorker(AsyncWorker):
             servers.append(server)
 
         while self.alive:
+            # CO(lk): wait here, cause server with handler has been started
             self.notify()
             gevent.sleep(1.0)
 
@@ -141,6 +142,7 @@ class GeventWorker(AsyncWorker):
         gevent.spawn(super().handle_usr1, sig, frame)
 
     def init_process(self):
+        # CO(lk): monkey patch is done before loading wsgi app
         self.patch()
         hub.reinit()
         super().init_process()

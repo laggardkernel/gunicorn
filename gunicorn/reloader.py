@@ -48,6 +48,7 @@ class Reloader(threading.Thread):
                 if old_time is None:
                     mtimes[filename] = mtime
                     continue
+                # CO(lk): only detect file modification, but not creation, deletion
                 elif mtime > old_time:
                     if self._callback:
                         self._callback(filename)
@@ -87,11 +88,12 @@ if has_inotify:
 
             if dirname in self._dirs:
                 return
-
+            # TODO(lk): watch the dir not the file? How inotify work?
             self._watcher.add_watch(dirname, mask=self.event_mask)
             self._dirs.add(dirname)
 
         def get_dirs(self):
+            # CO(lk): watch imported modules
             fnames = [
                 os.path.dirname(os.path.abspath(COMPILED_EXT_RE.sub('py', module.__file__)))
                 for module in tuple(sys.modules.values())
@@ -112,12 +114,14 @@ if has_inotify:
                     continue
 
                 filename = event[3]
-
+                # CO(lk): normally registered in Worker to stop the worker
+                #  A new one will be started in Arbiter
                 self._callback(filename)
 
 else:
 
     class InotifyReloader(object):
+        # TODO(lk): add extra_files=None
         def __init__(self, callback=None):
             raise ImportError('You must have the inotify module installed to '
                               'use the inotify reloader')

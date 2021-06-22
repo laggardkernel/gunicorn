@@ -18,6 +18,7 @@ class Unreader(object):
         raise NotImplementedError()
 
     def read(self, size=None):
+        # CO(lk): read from chunk and save into buf
         if size is not None and not isinstance(size, int):
             raise TypeError("size parameter must be an int or long.")
 
@@ -45,6 +46,7 @@ class Unreader(object):
                 return ret
             self.buf.write(chunk)
         data = self.buf.getvalue()
+        # CO(lk): size down buf, delete read part
         self.buf = io.BytesIO()
         self.buf.write(data[size:])
         return data[:size]

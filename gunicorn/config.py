@@ -21,6 +21,7 @@ from gunicorn import __version__, util
 from gunicorn.errors import ConfigError
 from gunicorn.reloader import reloader_engines
 
+# CO(lk): known settings/classes is filled by metaclass
 KNOWN_SETTINGS = []
 PLATFORM = sys.platform
 
@@ -58,6 +59,7 @@ class Config(object):
             v = self.settings[k].value
             if callable(v):
                 v = "<{}()>".format(v.__qualname__)
+            # CO(lk): align the output at the "=" sign
             lines.append("{k:{kmax}} = {v}".format(k=k, v=v, kmax=kmax))
         return "\n".join(lines)
 
@@ -74,6 +76,7 @@ class Config(object):
     def set(self, name, value):
         if name not in self.settings:
             raise AttributeError("No configuration setting for: %s" % name)
+        # CO(lk): validator called on Setting.set()
         self.settings[name].set(value)
 
     def get_cmd_args_from_env(self):
@@ -126,6 +129,7 @@ class Config(object):
     @property
     def address(self):
         s = self.settings['bind'].get()
+        # CO(lk): tuple of (host, port)
         return [util.parse_address(util.bytes_to_str(bind)) for bind in s]
 
     @property
@@ -142,10 +146,12 @@ class Config(object):
         if pn is not None:
             return pn
         else:
+            # CO(lk): default_proc_name "gunicorn"
             return self.settings['default_proc_name'].get()
 
     @property
     def logger_class(self):
+        # CO(lk): gunicorn logger, Statsd is also a logger
         uri = self.settings['logger_class'].get()
         if uri == "simple":
             # support the default
@@ -180,6 +186,7 @@ class Config(object):
 
     @property
     def env(self):
+        # CO(lk): "--env FOO=1" in cmd line, or "raw_env" in conf file
         raw_env = self.settings['raw_env'].get()
         env = {}
 
@@ -210,6 +217,8 @@ class Config(object):
 
     @property
     def reuse_port(self):
+        # CO(lk): BaseSocket.set_options() ->
+        #  sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         return self.settings['reuse_port'].get()
 
     @property
@@ -234,6 +243,9 @@ class Config(object):
 
 class SettingMeta(type):
     def __new__(cls, name, bases, attrs):
+        # CO(lk):
+        #  - save Setting subclass into KNOWN_SETTINGS list
+        #  - wrap "validator" func as a staticmethod
         super_new = super().__new__
         parents = [b for b in bases if isinstance(b, SettingMeta)]
         if not parents:
@@ -256,6 +268,7 @@ class SettingMeta(type):
 class Setting(object):
     name = None
     value = None
+    # CO(lk): subgroup settings into sections
     section = None
     cli = None
     validator = None
@@ -309,6 +322,7 @@ class Setting(object):
         return self.value
 
     def set(self, val):
+        # CO(lk): call validator on setting value
         if not callable(self.validator):
             raise TypeError('Invalid validator: %s' % self.name)
         self.value = self.validator(val)
@@ -327,6 +341,7 @@ class Setting(object):
         )
 
 
+# CO(lk): overrule Setting class with Setting class
 Setting = SettingMeta('Setting', (Setting,), {})
 
 

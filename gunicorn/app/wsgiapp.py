@@ -39,6 +39,7 @@ class WSGIApplication(Application):
         super().load_config()
 
         if self.app_uri is None:
+            # CO(lk): wsgi app string: $(MODULE_NAME):$(VARIABLE_NAME)
             if self.cfg.wsgi_app is not None:
                 self.app_uri = self.cfg.wsgi_app
             else:
@@ -64,6 +65,7 @@ def run():
     generic WSGI applications.
     """
     from gunicorn.app.wsgiapp import WSGIApplication
+    # CO(lk): usage param is used in argparse
     WSGIApplication("%(prog)s [OPTIONS] [APP_MODULE]").run()
 
 

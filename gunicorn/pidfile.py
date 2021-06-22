@@ -16,6 +16,7 @@ class Pidfile(object):
     """
 
     def __init__(self, fname):
+        # CO(lk): fname will be updated as the filename of the tempfile
         self.fname = fname
         self.pid = None
 
@@ -43,6 +44,7 @@ class Pidfile(object):
 
         # set permissions to -rw-r--r--
         os.chmod(self.fname, 420)
+        # TODO(lk): 420 or 422?
 
     def rename(self, path):
         self.unlink()
@@ -70,7 +72,7 @@ class Pidfile(object):
                     wpid = int(f.read())
                 except ValueError:
                     return
-
+                # CO(lk): find the old pid and kill the old process?
                 try:
                     os.kill(wpid, 0)
                     return wpid

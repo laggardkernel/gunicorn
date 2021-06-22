@@ -20,11 +20,13 @@ class BaseApplication(object):
     the various necessities for any given web framework.
     """
     def __init__(self, usage=None, prog=None):
+        # CO(lk): e.g. "%(prog)s [OPTIONS] [APP_MODULE]" passed in wsgi run()
         self.usage = usage
         self.cfg = None
         self.callable = None
         self.prog = prog
         self.logger = None
+        # CO(lk): load default conf and user conf
         self.do_load_config()
 
     def do_load_config(self):
@@ -33,6 +35,7 @@ class BaseApplication(object):
         """
         try:
             self.load_default_config()
+            # CO(lk): load_config() should be implemented in sub-classes
             self.load_config()
         except Exception as e:
             print("\nError: %s" % str(e), file=sys.stderr)
@@ -41,6 +44,7 @@ class BaseApplication(object):
 
     def load_default_config(self):
         # init configuration
+        # CO(lk): usage: "%(prog)s [OPTIONS] [APP_MODULE]", prog: None
         self.cfg = Config(self.usage, prog=self.prog)
 
     def init(self, parser, opts, args):
@@ -64,6 +68,7 @@ class BaseApplication(object):
 
     def wsgi(self):
         if self.callable is None:
+            # CO(lk): load() return app instance
             self.callable = self.load()
         return self.callable
 
@@ -118,6 +123,7 @@ class Application(BaseApplication):
         return vars(mod)
 
     def get_config_from_module_name(self, module_name):
+        # CO(lk): if config is a module/.py file. Use the variables as config
         return vars(importlib.import_module(module_name))
 
     def load_config_from_module_name_or_filename(self, location):
@@ -141,6 +147,7 @@ class Application(BaseApplication):
             if k not in self.cfg.settings:
                 continue
             try:
+                # CO(lk): Setting validator is called on set()
                 self.cfg.set(k.lower(), v)
             except Exception:
                 print("Invalid value for %s: %s\n" % (k, v), file=sys.stderr)
@@ -154,11 +161,13 @@ class Application(BaseApplication):
 
     def load_config(self):
         # parse console args
+        # CO(lk): generate parser from each Setting
         parser = self.cfg.parser()
         args = parser.parse_args()
 
         # optional settings from apps
         cfg = self.init(parser, args, args.args)
+        # CO(lk): `WSGIApplication` doesn't return any cfg. set app_uri, proc name
 
         # set up import paths and follow symlinks
         self.chdir()
@@ -168,17 +177,29 @@ class Application(BaseApplication):
             for k, v in cfg.items():
                 self.cfg.set(k.lower(), v)
 
+        # CO(lk): GUNICORN_CMD_ARGS
         env_args = parser.parse_args(self.cfg.get_cmd_args_from_env())
 
+        # CO(lk): conf location priority (the location str)
+        #  1. from cmd line
+        #  2. from env variable
+        #  3. from default conf file
+        #  only the 1st found will be used
         if args.config:
             self.load_config_from_file(args.config)
         elif env_args.config:
             self.load_config_from_file(env_args.config)
         else:
+            # CO(lk): default conf `$PWD/gunicorn.conf.py`
             default_config = get_default_config_file()
             if default_config is not None:
                 self.load_config_from_file(default_config)
 
+        # CO(lk): Settings priority
+        #  1. from conf file
+        #  2. env var
+        #  3. cmd line args
+        #  later overwrites the former
         # Load up environment configuration
         for k, v in vars(env_args).items():
             if v is None:
@@ -205,6 +226,7 @@ class Application(BaseApplication):
 
         if self.cfg.print_config or self.cfg.check_config:
             try:
+                # TODO(lk): load app obj from app_uri/string, why not saved on .callable
                 self.load()
             except Exception:
                 msg = "\nError while loading the application:\n"
@@ -214,10 +236,12 @@ class Application(BaseApplication):
                 sys.exit(1)
             sys.exit(0)
 
+        # CO(lk): trace hook `Spew`. Print what code is being executed.
         if self.cfg.spew:
             debug.spew()
 
         if self.cfg.daemon:
+            # CO(lk): daemonize when not `reexec`ed
             util.daemonize(self.cfg.enable_stdio_inheritance)
 
         # set python paths

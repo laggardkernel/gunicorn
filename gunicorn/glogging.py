@@ -45,6 +45,7 @@ SYSLOG_FACILITIES = {
 }
 
 
+# NOTE(lk): used to be merged with user dict, loggers are not init from here
 CONFIG_DEFAULTS = dict(
         version=1,
         disable_existing_loggers=False,
@@ -183,6 +184,7 @@ class Logger(object):
     atoms_wrapper_class = SafeAtoms
 
     def __init__(self, cfg):
+        # CO(lk): compose a logger with other 2 loggers, to output to different loc
         self.error_log = logging.getLogger("gunicorn.error")
         self.error_log.propagate = False
         self.access_log = logging.getLogger("gunicorn.access")
@@ -198,13 +200,14 @@ class Logger(object):
         self.loglevel = self.LOG_LEVELS.get(cfg.loglevel.lower(), logging.INFO)
         self.error_log.setLevel(self.loglevel)
         self.access_log.setLevel(logging.INFO)
-
+        # NOTE(lk): redirect output by dup file descriptors if not "-"
         # set gunicorn.error handler
         if self.cfg.capture_output and cfg.errorlog != "-":
             for stream in sys.stdout, sys.stderr:
                 stream.flush()
 
             self.logfile = open(cfg.errorlog, 'a+')
+            # NOTE(lk): replace stdout, stderr with logfile
             os.dup2(self.logfile.fileno(), sys.stdout.fileno())
             os.dup2(self.logfile.fileno(), sys.stderr.fileno())
 
@@ -280,6 +283,7 @@ class Logger(object):
         status = resp.status
         if isinstance(status, str):
             status = status.split(None, 1)[0]
+        # CO(lk): define formatter atoms?
         atoms = {
             'h': environ.get('REMOTE_ADDR', '-'),
             'l': '-',
@@ -346,6 +350,7 @@ class Logger(object):
         )
 
         try:
+            # TODO(lk): how atoms are used in Logger.log()
             self.access_log.info(self.cfg.access_log_format, safe_atoms)
         except Exception:
             self.error(traceback.format_exc())
@@ -390,6 +395,7 @@ class Logger(object):
 
     def _get_gunicorn_handler(self, log):
         for h in log.handlers:
+            # CO(lk): _gunicorn set in `_set_handler()`
             if getattr(h, "_gunicorn", False):
                 return h
 

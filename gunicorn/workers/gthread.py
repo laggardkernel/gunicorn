@@ -34,6 +34,7 @@ class TConn(object):
 
     def __init__(self, cfg, sock, client, server):
         self.cfg = cfg
+        # CO(lk): sock: conn; client: client addr; server: listening socket name
         self.sock = sock
         self.client = client
         self.server = server
@@ -45,6 +46,7 @@ class TConn(object):
         self.sock.setblocking(False)
 
     def init(self):
+        # TODO(lk): why?
         self.sock.setblocking(True)
         if self.parser is None:
             # wrap the socket if needed
@@ -67,13 +69,16 @@ class ThreadWorker(base.Worker):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # CO(lk): max clients, limit for eventlet, gevent workers
         self.worker_connections = self.cfg.worker_connections
         self.max_keepalived = self.cfg.worker_connections - self.cfg.threads
         # initialise the pool
         self.tpool = None
         self.poller = None
         self._lock = None
+        # CO(lk): processing req
         self.futures = deque()
+        # CO(lk): req needs to be keep-alive. SyncWorker doesn't support long conn
         self._keep = deque()
         self.nr_conns = 0
 
@@ -86,6 +91,7 @@ class ThreadWorker(base.Worker):
                         "Check the number of worker connections and threads.")
 
     def init_process(self):
+        # CO(lk): entry point called in Arbiter.spawn_worker() by fork
         self.tpool = self.get_thread_pool()
         self.poller = selectors.DefaultSelector()
         self._lock = RLock()
@@ -112,22 +118,29 @@ class ThreadWorker(base.Worker):
         conn.init()
         # submit the connection to a worker
         fs = self.tpool.submit(self.handle, conn)
+        # CO(lk): handle() returns (boolean, conn), bool indicates if keepalive or not
         self._wrap_future(fs, conn)
 
     def accept(self, server, listener):
         try:
+            # CO(lk): socket.accept() returns (conn, address), where conn is
+            #  a new socket object usable to send and receive data on the connection
             sock, client = listener.accept()
             # initialize the connection object
             conn = TConn(self.cfg, sock, client, server)
             self.nr_conns += 1
             # enqueue the job
             self.enqueue_req(conn)
+            # CO(lk): submit the handle() task into thread pool and wait for future
         except EnvironmentError as e:
             if e.errno not in (errno.EAGAIN, errno.ECONNABORTED,
                                errno.EWOULDBLOCK):
                 raise
 
     def reuse_connection(self, conn, client):
+        # CO(lk): current TConn is flagged as keepalive. We're not sure if it's
+        #  keepalive after this round request handling, un-flag it first.
+        #  A thread handles one req at a time, unregister selecting socket conn.
         with self._lock:
             # unregister the client from the poller
             self.poller.unregister(client)
@@ -163,6 +176,7 @@ class ThreadWorker(base.Worker):
                 with self._lock:
                     try:
                         self.poller.unregister(conn.sock)
+                        # CO(lk): ._keep stores conn, poller hold registered conn.sock
                     except EnvironmentError as e:
                         if e.errno != errno.EBADF:
                             raise
@@ -187,8 +201,10 @@ class ThreadWorker(base.Worker):
             # a race condition during graceful shutdown may make the listener
             # name unavailable in the request handler so capture it once here
             server = sock.getsockname()
+            # CO(lk): register(fileobj, events, data=None). accept() as callback
             acceptor = partial(self.accept, server)
             self.poller.register(sock, selectors.EVENT_READ, acceptor)
+            # CO(lk): Handle connection. Register callback .accept(server, listener).
 
         while self.alive:
             # notify the arbiter we are alive
@@ -196,12 +212,21 @@ class ThreadWorker(base.Worker):
 
             # can we accept more connections?
             if self.nr_conns < self.worker_connections:
+                # CO(lk): wait for connections in a `while` loop.
                 # wait for an event
                 events = self.poller.select(1.0)
+                # CO(lk): (SelectorKey, Event)
+                #  The real callback `.handle()` is submitted into ThreadPoolExecutor
+                #  and returned as a future, appended into `self.futures`.
+                #  Here, we're calling self.accept() -> .enqueue_req() ->
+                #  put the request handling task in .futures .handle().
+                #  The return value (keepalive, conn) from .handle() goes through
+                #  done callback: .finish_request(fs).
                 for key, _ in events:
                     callback = key.data
                     callback(key.fileobj)
-
+                # CO(lk): .futures store req being handling, fetch once any of them
+                #  is done. Non-blocking with timeout=0.
                 # check (but do not wait) for finished requests
                 result = futures.wait(self.futures, timeout=0,
                                       return_when=futures.FIRST_COMPLETED)
@@ -229,6 +254,8 @@ class ThreadWorker(base.Worker):
         futures.wait(self.futures, timeout=self.cfg.graceful_timeout)
 
     def finish_request(self, fs):
+        # CO(lk): fs: (should_keepalive_or_not, conn). Re-register the sock back
+        #  to ThreadPoolExecutor if keepalive.
         if fs.cancelled():
             self.nr_conns -= 1
             fs.conn.close()
@@ -248,6 +275,8 @@ class ThreadWorker(base.Worker):
                     self._keep.append(conn)
 
                     # add the socket to the event loop
+                    # NOTE(lk): in .run() we select the listening socket,
+                    #  here we select the connection socket from socket.accept()
                     self.poller.register(conn.sock, selectors.EVENT_READ,
                                          partial(self.reuse_connection, conn))
             else:
@@ -260,6 +289,7 @@ class ThreadWorker(base.Worker):
             fs.conn.close()
 
     def handle(self, conn):
+        # CO(lk): processed in thread, return (keepalive, conn) as Future result
         keepalive = False
         req = None
         try:
@@ -305,6 +335,7 @@ class ThreadWorker(base.Worker):
         try:
             self.cfg.pre_request(self, req)
             request_start = datetime.now()
+            # CO(lk): build environ, response sender
             resp, environ = wsgi.create(req, conn.sock, conn.client,
                                         conn.server, self.cfg)
             environ["wsgi.multithread"] = True

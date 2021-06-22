@@ -45,6 +45,7 @@ class BaseSocket(object):
             except socket.error as err:
                 if err.errno not in (errno.ENOPROTOOPT, errno.EINVAL):
                     raise
+        # CO(lk): bind to a ip addr or not
         if not bound:
             self.bind(sock)
         sock.setblocking(0)
@@ -53,6 +54,7 @@ class BaseSocket(object):
         if hasattr(sock, "set_inheritable"):
             sock.set_inheritable(True)
 
+        # CO(lk): Setting, number of clients that can be waiting to be served
         sock.listen(self.conf.backlog)
         return sock
 
@@ -103,6 +105,7 @@ class UnixSocket(BaseSocket):
     FAMILY = socket.AF_UNIX
 
     def __init__(self, addr, conf, log, fd=None):
+        # NOTE(lk): for unix socket, param "addr" is not address, but sock_name
         if fd is None:
             try:
                 st = os.stat(addr)
@@ -120,6 +123,7 @@ class UnixSocket(BaseSocket):
         return "unix:%s" % self.cfg_addr
 
     def bind(self, sock):
+        # NOTE(lk): override BaseSocket.bind(), unix socket behaves differently
         old_umask = os.umask(self.conf.umask)
         sock.bind(self.cfg_addr)
         util.chown(self.cfg_addr, self.conf.uid, self.conf.gid)
@@ -154,6 +158,7 @@ def create_sockets(conf, log, fds=None):
     fdaddr = [bind for bind in addr if isinstance(bind, int)]
     if fds:
         fdaddr += list(fds)
+    # CO(lk): this is what we normally use, bind it tuple (host, port)
     laddr = [bind for bind in addr if not isinstance(bind, int)]
 
     # check ssl config early to raise the error on startup
@@ -163,10 +168,12 @@ def create_sockets(conf, log, fds=None):
 
     if conf.keyfile and not os.path.exists(conf.keyfile):
         raise ValueError('keyfile "%s" does not exist' % conf.keyfile)
+    # NOTE(lk): choose one from unix socket and tcp socket
 
     # sockets are already bound
     if fdaddr:
         for fd in fdaddr:
+            # CO(lk): create a socket obj
             sock = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)
             sock_name = sock.getsockname()
             sock_type = _sock_type(sock_name)
@@ -179,6 +186,7 @@ def create_sockets(conf, log, fds=None):
     for addr in laddr:
         sock_type = _sock_type(addr)
         sock = None
+        # TODO(lk): why we retry on ip socket creation?
         for i in range(5):
             try:
                 sock = sock_type(addr, conf, log)
